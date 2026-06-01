@@ -1,5 +1,13 @@
 # Ragent 基础设施层 (Framework) 研究报告
 
+## 研究结论
+
+`framework` 模块定位为 Ragent 的基础设施与横切能力层，承担“业务无关工程底座”的职责，而不是 RAG 业务框架本身。它把统一响应、错误码、异常处理、用户上下文、幂等控制、RocketMQ 发送与事务消息、MyBatis-Plus 配置、分布式 ID、RAG Trace 注解等能力集中沉淀，供 `bootstrap`、`infra-ai` 等模块复用。
+
+整体设计接近 Spring Boot Starter 风格：业务层通过注解、接口、统一模型和自动配置接入底层能力，减少对 Redis、RocketMQ、MyBatis-Plus、Sa-Token 等具体基础设施的直接感知。
+
+> 说明：GitNexus 索引曾提示落后 HEAD 6 个提交，本报告以当前工作区源码为主要依据。
+
 ## 一、整体架构概览
 
 Framework 模块是 Ragent 的基础设施层，提供与业务无关的通用能力，覆盖 10 个横切关注点：
@@ -772,7 +780,142 @@ public class RetrievedChunk {
 
 ---
 
-## 十六、源文件索引
+## 十六、设计模式与实现归纳
+
+### 16.1 AOP / 注解驱动
+
+Framework 层大量采用“注解声明意图 + AOP 执行横切逻辑”的方式：
+
+| 注解 | 处理者 | 作用 |
+|------|--------|------|
+| `@IdempotentSubmit` | `IdempotentSubmitAspect` | 防止接口重复提交 |
+| `@IdempotentConsume` | `IdempotentConsumeAspect` | 防止 MQ 消费重复执行 |
+| `@RagTraceRoot` | 业务层 `RagTraceAspect` | 标记一次完整 RAG 请求链路 |
+| `@RagTraceNode` | 业务层 `RagTraceAspect` | 标记 RAG 链路中的子节点 |
+
+这种设计把幂等、Trace 等横切关注点从业务逻辑中剥离出来，业务代码只表达“这里需要幂等”或“这里是一个 Trace 节点”，具体加锁、Redis 状态机、链路记录由基础设施层负责。
+
+### 16.2 适配器模式
+
+`MessageQueueProducer` 定义消息发送抽象，`RocketMQProducerAdapter` 适配 RocketMQ 具体实现：
+
+```java
+public interface MessageQueueProducer {
+    SendResult send(String topic, String keys, String bizDesc, Object body);
+
+    void sendInTransaction(String topic, String keys, String bizDesc, Object body,
+                           Consumer<Object> localTransaction);
+}
+```
+
+业务层依赖 `MessageQueueProducer`，而不是直接依赖 `RocketMQTemplate`。这降低了业务模块对 RocketMQ API 的耦合，也为后续统一埋点、重试、降级或替换 MQ 实现留下空间。
+
+### 16.3 委派 / 策略模式
+
+`DelegatingTransactionListener` 按 topic 注册 `TransactionChecker`，事务回查时委派给对应 checker 判断本地事务是否已提交：
+
+```java
+public void registerChecker(String topic, TransactionChecker checker) {
+    checkerMap.put(topic, checker);
+}
+```
+
+这里的设计重点不是简单的 map 查找，而是把“如何判断本地事务是否提交”交给不同业务实现。`TransactionChecker` 的注释明确要求回查逻辑必须基于消息内容查询 DB，不能依赖内存状态，因为 Broker 可能把回查请求发送到任意实例。
+
+### 16.4 工厂式构造 / 统一契约
+
+`Results` 集中构造成功和失败响应，`GlobalExceptionHandler` 集中把异常转换成统一 `Result`：
+
+```java
+public static <T> Result<T> success(T data) { ... }
+
+static Result<Void> failure(AbstractException abstractException) { ... }
+```
+
+这种方式避免各业务模块自行拼装响应体，减少前后端协议漂移。
+
+### 16.5 错误码抽象
+
+`IErrorCode` 定义错误码协议，`BaseErrorCode` 提供基础错误码枚举，`AbstractException` 绑定错误码与异常消息：
+
+```java
+public interface IErrorCode {
+    String code();
+    String message();
+}
+```
+
+异常体系通过 `ClientException`、`ServiceException`、`RemoteException` 对应 A/B/C 三类错误，便于日志分析、前端提示和问题归因。
+
+---
+
+## 十七、工程化评价
+
+### 17.1 优点
+
+| 维度 | 评价 |
+|------|------|
+| 模块边界 | `framework` 基本承接横切基础能力，没有混入明显业务流程 |
+| 接口抽象 | MQ 发送通过 `MessageQueueProducer` 抽象，业务层不直接绑定 RocketMQ |
+| 注解驱动 | 幂等和 Trace 对业务侵入较低，使用方式清晰 |
+| 统一契约 | `Result`、`Results`、`BaseErrorCode`、`AbstractException`、`GlobalExceptionHandler` 形成闭环 |
+| 并发意识 | 使用 `TransmittableThreadLocal` 处理跨线程上下文，Stream Trace 显式考虑异步线程完成节点 |
+| 分布式意识 | MQ 事务回查要求基于 DB 判断，避免依赖单实例内存状态 |
+| 构建治理 | 根 POM 统一管理 Spring Boot、MyBatis-Plus、RocketMQ、Sa-Token、Redisson 等版本 |
+
+### 17.2 风险与不足
+
+| 问题 | 影响 | 建议 |
+|------|------|------|
+| `framework/src/test` 暂无测试文件 | 幂等、事务消息、异常处理等基础能力缺少回归保护 | 优先补幂等切面、事务消息、异常处理的单元测试或集成测试 |
+| 模块依赖偏宽 | 使用方会被动携带 Web、Redis、Redisson、RocketMQ、Sa-Token、MyBatis-Plus 等依赖 | 后续可按能力拆成更细 starter 或子模块 |
+| 自动配置条件不足 | 当前配置类未明显使用 `@ConditionalOnClass`、`@ConditionalOnBean`、`@ConditionalOnMissingBean` | 增加条件装配，提高可插拔性 |
+| 提交幂等语义偏并发锁 | `IdempotentSubmitAspect` 方法执行结束即释放锁，适合防并发重复提交，不等同于窗口期防重复点击 | 在注释或文档中明确语义，必要时增加带 TTL 的提交令牌模式 |
+| 失败响应构造受限 | `Results.failure(...)` 为包级可见，业务层自定义失败响应能力有限 | 保持异常驱动风格的同时，评估是否需要开放受控构造方法 |
+| 日志策略仍可细化 | `AbstractException` 无 cause 时记录前 5 层栈，有助排查但需注意敏感信息 | 后续可统一 requestId、脱敏策略和日志等级 |
+
+### 17.3 当前成熟度判断
+
+Framework 层已经具备较完整的中小型 Spring Boot 后端基础设施形态：统一协议、统一异常、幂等控制、消息发送、事务消息、上下文传递和链路追踪都有明确抽象。
+
+它距离成熟 starter 体系的主要差距不在功能数量，而在工程弹性和验证保护：条件装配、依赖拆分、测试覆盖、配置隔离仍有提升空间。
+
+---
+
+## 十八、值得学习的地方
+
+### 18.1 把工程约束做成机制，而不是靠约定
+
+业务只写 `@IdempotentSubmit` 就能获得分布式锁防重复提交；只注入 `MessageQueueProducer` 就能统一发送普通消息和事务消息；只抛 `ClientException` / `ServiceException` 就能进入统一错误响应。这种设计把“团队约定”固化为可复用机制，降低长期维护成本。
+
+### 18.2 异步与分布式边界处理得比较清楚
+
+`TransactionChecker` 明确提醒事务回查可能落到任意实例，所以必须查 DB；`RagStreamTraceSupport` 明确区分调用线程提交任务和 worker 线程完成 SSE 读循环，避免 Trace 只记录到 `runAsync` 提交阶段。这类边界意识是基础设施层最值得保留的能力。
+
+### 18.3 统一契约先行
+
+`Result`、`IErrorCode`、`AbstractException`、`GlobalExceptionHandler` 先定义系统对外表达方式，再让业务逻辑接入。这能减少“每个模块各写各的返回结构、错误码和日志格式”的问题。
+
+### 18.4 接口隔离具体基础设施
+
+`MessageQueueProducer` 对业务层隐藏 RocketMQ 细节，是一个可以继续推广的模式。类似思路也可以用于缓存、对象存储、向量数据库、模型服务调用等外部基础设施。
+
+### 18.5 小而完整的横切闭环
+
+每个能力不是只提供一个工具类，而是尽量形成闭环：
+
+| 能力 | 闭环组成 |
+|------|----------|
+| 异常 | 错误码接口、基础错误码、异常基类、异常子类、全局异常处理 |
+| 幂等 | 注解、SpEL key 解析、切面、Redis/Redisson 状态控制、业务异常 |
+| MQ | 消息包装、生产者接口、RocketMQ 适配器、事务监听器、回查接口 |
+| Trace | 根注解、节点注解、上下文、跨线程 Stream 支撑、业务 AOP 实现 |
+
+这种“能力闭环”比零散工具类更适合沉淀为团队基础设施。
+
+---
+
+## 十九、源文件索引
 
 ### 异常体系
 | 文件 | 职责 |
